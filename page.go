@@ -18,11 +18,24 @@ type Page struct {
 // Page returns the page for the given page number.
 // Page numbers are indexed starting at 1, not 0.
 // If the page is not found, Page returns a Page with p.V.IsNull().
+// maxPageTreeDepth bounds descent through /Pages nodes. Real page trees are a
+// handful of levels deep — Acrobat builds balanced trees, so 64 levels would
+// address more pages than any document has. The bound exists because a /Pages
+// node that reaches itself, directly or through a cycle, otherwise descends
+// forever: num is unchanged on the `continue Search` below, so the loop makes
+// no progress. It raises no panic, so a recover() in the caller cannot catch
+// it — the process simply spins. A 226-byte file is enough to trigger it.
+const maxPageTreeDepth = 64
+
 func (r *Reader) Page(num int) Page {
 	num-- // now 0-indexed
 	page := r.Trailer().Key("Root").Key("Pages")
+	depth := 0
 Search:
 	for page.Key("Type").Name() == "Pages" {
+		if depth++; depth > maxPageTreeDepth {
+			return Page{}
+		}
 		count := int(page.Key("Count").Int64())
 		if count < num {
 			return Page{}
@@ -133,7 +146,19 @@ func (f Font) Width(code int) float64 {
 }
 
 // Encoder returns the encoding between font code point sequences and UTF-8.
+//
+// ToUnicode is consulted first. PDF 32000 makes it the authoritative mapping
+// for text *extraction*, while /Encoding and its Differences array describe
+// glyph *selection* — for a subsetted font those names are often arbitrary,
+// so decoding through them yields plausible-looking nonsense. Only when a
+// font carries no ToUnicode CMap do the encoding tables below apply.
 func (f Font) Encoder() TextEncoding {
+	if tu := f.V.Key("ToUnicode"); tu.Kind() == Stream || tu.Kind() == Dict {
+		if m := readCmap(tu); m != nil {
+			return m
+		}
+	}
+
 	enc := f.V.Key("Encoding")
 	switch enc.Kind() {
 	case Name:
@@ -143,11 +168,14 @@ func (f Font) Encoder() TextEncoding {
 		case "MacRomanEncoding":
 			return &byteEncoder{&macRomanEncoding}
 		case "Identity-H":
-			// TODO: Should be big-endian UCS-2 decoder
-			return &nopEncoder{}
+			// Identity-H maps two-byte codes straight to CIDs, which carry
+			// no inherent Unicode meaning — the font's ToUnicode CMap is the
+			// only route to text. Fall through to it below rather than
+			// passing raw code bytes through, which yields mojibake for
+			// every subsetted font (Chrome, Word, Acrobat all emit this).
 		default:
-			println("unknown encoding", enc.Name())
-			return &nopEncoder{}
+			// An encoding we do not model. A ToUnicode CMap, if the font has
+			// one, is still better than raw bytes — fall through to it.
 		}
 	case Dict:
 		return &dictEncoder{enc.Key("Differences")}
@@ -158,8 +186,11 @@ func (f Font) Encoder() TextEncoding {
 		return &nopEncoder{}
 	}
 
+	// ToUnicode is a CMap *stream*, so its Kind is Stream, never Dict. The
+	// original check could not match a real ToUnicode entry, which is why
+	// this path never fired for any font.
 	toUnicode := f.V.Key("ToUnicode")
-	if toUnicode.Kind() == Dict {
+	if k := toUnicode.Kind(); k == Stream || k == Dict {
 		m := readCmap(toUnicode)
 		if m == nil {
 			return &nopEncoder{}
@@ -328,6 +359,29 @@ func readCmap(toUnicode Value) *cmap {
 				dst, srcHi, srcLo := stk.Pop(), stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfrange = append(m.bfrange, bfrange{srcLo, srcHi, dst})
 			}
+		case "beginbfchar":
+			n = int(stk.Pop().Int64())
+		case "endbfchar":
+			// bfchar maps single codes rather than ranges: `<src> <dst>`
+			// pairs. Subsetted fonts emit mostly these, so without them a
+			// CMap parses but maps almost nothing. Model each as a
+			// degenerate range whose lo and hi are equal, so Decode needs
+			// no second code path.
+			if n < 0 {
+				println("missing beginbfchar")
+				ok = false
+				return
+			}
+			for i := 0; i < n; i++ {
+				dst, src := stk.Pop(), stk.Pop().RawString()
+				if len(src) == 0 {
+					println("bad bfchar source")
+					ok = false
+					return
+				}
+				m.bfrange = append(m.bfrange, bfrange{src, src, dst})
+			}
+			n = -1
 		case "defineresource":
 			category := stk.Pop().Name()
 			value := stk.Pop()
